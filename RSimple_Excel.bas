@@ -44,7 +44,6 @@ Private Type TipoFila
     Glosa As String
     Cuenta As String
     Montos() As Currency
-    EsSubtotalCuenta As Boolean
     EsSubtotalSeccion As Boolean
     EsTotalGeneral As Boolean
     TextoEncabezado As String
@@ -209,6 +208,7 @@ End Sub
 ' =============================================================================
 ' FORMATO 5.2 - LIBRO DIARIO SIMPLIFICADO CON COLUMNAS DINÁMICAS Y AGRUPACIÓN
 ' Orden: Cuenta → Fecha Documento → Correlativo
+' Subtotales: Solo por Sección
 ' =============================================================================
 Public Function ExcelDiarioSimplificadoF52(ByVal sTablaDetalle As String, _
                                            ByVal sTablaSubtotales As String, _
@@ -218,11 +218,10 @@ Public Function ExcelDiarioSimplificadoF52(ByVal sTablaDetalle As String, _
     Dim aCuentas() As TipoColumna, aFilas() As TipoFila
     Dim nCuentas As Integer, nFilas As Long, fila As Long
     Dim iCol As Integer, i As Long, lFilaIni As Long
-    Dim sCuentaAnt As String, iSeccionAnt As Integer, iSeccionActual As Integer
+    Dim iSeccionAnt As Integer, iSeccionActual As Integer
     Dim cTotDebe As Currency, cTotHaber As Currency
-    Dim cSubCuentaDebe As Currency, cSubCuentaHaber As Currency
     Dim cSubSeccionDebe As Currency, cSubSeccionHaber As Currency
-    Dim col As Integer, val As Currency
+    Dim col As Integer
     
     On Error GoTo ErrHandler
     Screen.MousePointer = vbHourglass
@@ -257,11 +256,10 @@ Public Function ExcelDiarioSimplificadoF52(ByVal sTablaDetalle As String, _
     
     ' Arma arreglo de filas
     rsDetalle.MoveLast: nFilas = rsDetalle.RecordCount: rsDetalle.MoveFirst
-    ReDim aFilas(1 To nFilas * 3 + 100) ' Con espacio para separadores y subtotales
+    ReDim aFilas(1 To nFilas * 2 + 50) ' Con espacio para separadores y subtotales
     ReDim aFilas(1).Montos(1 To nCuentas)
     
     fila = 0
-    sCuentaAnt = ""
     iSeccionAnt = 0
     
     Do While Not rsDetalle.EOF
@@ -276,14 +274,8 @@ Public Function ExcelDiarioSimplificadoF52(ByVal sTablaDetalle As String, _
         If iSeccionActual <> iSeccionAnt Then
             fila = fila + 1
             aFilas(fila).EsSubtotalSeccion = False
-            aFilas(fila).EsSubtotalCuenta = False
             aFilas(fila).TextoEncabezado = aSecciones(iSeccionActual).Nombre
             iSeccionAnt = iSeccionActual
-        End If
-        
-        ' Si cambió cuenta, agrega subtotal anterior
-        If rsDetalle!Cuenta & "" <> sCuentaAnt And sCuentaAnt <> "" Then
-            GoSub PonerSubtotalCuenta
         End If
         
         ' Agrega fila de detalle
@@ -301,24 +293,19 @@ Public Function ExcelDiarioSimplificadoF52(ByVal sTablaDetalle As String, _
         If iCol > 0 Then
             If rsDetalle!Debe & "" <> "" Then
                 aFilas(fila).Montos(iCol) = aFilas(fila).Montos(iCol) + CCur(rsDetalle!Debe)
-                cSubCuentaDebe = cSubCuentaDebe + CCur(rsDetalle!Debe)
                 cSubSeccionDebe = cSubSeccionDebe + CCur(rsDetalle!Debe)
                 cTotDebe = cTotDebe + CCur(rsDetalle!Debe)
             End If
             If rsDetalle!Haber & "" <> "" Then
                 aFilas(fila).Montos(iCol) = aFilas(fila).Montos(iCol) - CCur(rsDetalle!Haber)
-                cSubCuentaHaber = cSubCuentaHaber + CCur(rsDetalle!Haber)
                 cSubSeccionHaber = cSubSeccionHaber + CCur(rsDetalle!Haber)
                 cTotHaber = cTotHaber + CCur(rsDetalle!Haber)
             End If
         End If
         
-        sCuentaAnt = rsDetalle!Cuenta & ""
         rsDetalle.MoveNext
     Loop
     
-    ' Último subtotal de cuenta
-    If sCuentaAnt <> "" Then GoSub PonerSubtotalCuenta
     ' Último subtotal de sección
     If iSeccionAnt <> 0 Then GoSub PonerSubtotalSeccion
     
@@ -351,18 +338,6 @@ Public Function ExcelDiarioSimplificadoF52(ByVal sTablaDetalle As String, _
                 .Cells(lFilaIni + fila, 1).Font.Size = 9
                 .Cells(lFilaIni + fila, 1).Interior.Color = RGB(220, 230, 240)
                 .Rows(lFilaIni + fila).RowHeight = 18
-            ElseIf aFilas(i).EsSubtotalCuenta Then
-                ' Subtotal de cuenta
-                .Cells(lFilaIni + fila, 4).Value = "SUBTOTAL"
-                .Cells(lFilaIni + fila, 4).Font.Bold = True
-                For col = 1 To nCuentas
-                    If aFilas(i).Montos(col) <> 0 Then
-                        .Cells(lFilaIni + fila, 4 + col).Value = aFilas(i).Montos(col)
-                        .Cells(lFilaIni + fila, 4 + col).NumberFormat = kFMT_MONTO
-                        .Cells(lFilaIni + fila, 4 + col).Font.Bold = True
-                    End If
-                Next
-                .Rows(lFilaIni + fila).RowHeight = 16
             ElseIf aFilas(i).EsSubtotalSeccion Then
                 ' Subtotal de sección
                 .Cells(lFilaIni + fila, 4).Value = "TOTAL SECCION"
@@ -423,20 +398,6 @@ Salir:
     rsSubtot.Close: Set rsSubtot = Nothing
     Screen.MousePointer = vbArrow
     Exit Function
-
-PonerSubtotalCuenta:
-    fila = fila + 1
-    If fila > UBound(aFilas) Then ReDim Preserve aFilas(1 To fila + 50)
-    ReDim aFilas(fila).Montos(1 To nCuentas)
-    aFilas(fila).EsSubtotalCuenta = True
-    For col = 1 To nCuentas
-        aFilas(fila).Montos(col) = 0
-    Next
-    ' Llena solo la primera columna de montos si es Debe/Haber
-    aFilas(fila).Montos(1) = cSubCuentaDebe
-    If nCuentas > 1 Then aFilas(fila).Montos(2) = cSubCuentaHaber
-    cSubCuentaDebe = 0: cSubCuentaHaber = 0
-    Return
 
 PonerSubtotalSeccion:
     fila = fila + 1
