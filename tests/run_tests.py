@@ -18,6 +18,9 @@ RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODULOS = {
     "Diario52": os.path.join(RAIZ, "RSimple_Diario52.bas"),
     "Pruebas": os.path.join(RAIZ, "tests", "D52_Pruebas.bas"),
+    # Solo se compila junto con los demas (verificacion de sintaxis/nombres);
+    # la automatizacion de Excel no se ejecuta aqui.
+    "ExcelF52": os.path.join(RAIZ, "RSimple_Excel.bas"),
 }
 
 RUNNER = """Option VBASupport 1

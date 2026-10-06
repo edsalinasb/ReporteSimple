@@ -449,6 +449,15 @@ Begin VB.Form frmRSimple
       Top             =   1080
       Width           =   1200
    End
+   Begin VB.CommandButton cmdExcel 
+      Caption         =   "E&xcel"
+      Height          =   400
+      Left            =   6720
+      TabIndex        =   27
+      Top             =   1560
+      Visible         =   0   'False
+      Width           =   1200
+   End
    Begin VB.CommandButton cmdCancelar 
       Cancel          =   -1  'True
       Caption         =   "&Cancelar"
@@ -523,6 +532,10 @@ Public SortCrystal As String
 Private lRegistros As Long
 Private rs4 As DAO.Recordset
 Private oViewSaldos As VerSaldosCTB
+Private Declare Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+Private Const kMAX_REINTENTOS_BLOQUEO As Integer = 5
+Private Const kCTA_CONTRA_COSTOS As String = "7911101     "
+Private Const kTITULO_FORMATO_5_2 As String = "FORMATO 5.2: LIBRO DIARIO DE FORMATO SIMPLIFICADO"
 
 Private Sub Form_Activate()
     Select Case iReporte
@@ -535,6 +548,7 @@ Private Sub Form_Activate()
         Case kFormatos_5_2
             frmResumen.Visible = True
             frmResumen.Caption = "Compras/Ventas"
+            cmdExcel.Visible = True
             opResumen(0).Value = True
             opResumen(1).Value = False
             
@@ -604,7 +618,10 @@ Public Function PrepararReporte() As Boolean
                 .Orientacion = 1
                 .crArchivo = "FORMATO5_2.rpt"
                 .sSql = "SELECT Ctb.Cuenta, Ctb.Detalle, Ctb.TipoNumero, Ctb.DebeMN, Ctb.HaberMN, Ctb.Fecha_Operacion, Ctb.Nombre From " & cfFile14 & " Ctb"
-                Call PreparaDetalledelDiarioSimplificado
+                If Not PrepararDiarioSimplificadoSeguro() Then
+                    PrepararReporte = False
+                    Exit Function
+                End If
                 .LoadPrint
                 Call PreparaDiarioSimplificadoAnalitico
                 .Files "Ctb", cfFile7
@@ -990,12 +1007,53 @@ Private Function aCeros(aData() As Currency)
     Next
 End Function
 
-Private Function ActualizaTransacciones(rs4 As DAO.Recordset, Tipo As String, Numero As String, Cuenta As String, Fecha As String, Debe As Currency, Haber As Currency, DebeMN As Currency, HaberMN As Currency, DebeME As Currency, HaberME As Currency, Detalle As String)
+Private Function PrepararDiarioSimplificadoSeguro() As Boolean
+    Dim iPuntero As Integer, sDesc As String
+    iPuntero = Screen.MousePointer
+    On Error GoTo Fallo
+    Screen.MousePointer = vbHourglass
+    PreparaDetalledelDiarioSimplificado
+    Screen.MousePointer = iPuntero
+    PrepararDiarioSimplificadoSeguro = True
+    Exit Function
+Fallo:
+    sDesc = Err.Description
+    Screen.MousePointer = iPuntero
+    MsgBox "No se pudo preparar el Libro Diario Simplificado (Formato 5.2)." & vbCrLf & vbCrLf & sDesc, vbCritical, "Formato 5.2"
+End Function
+
+' Exporta el Formato 5.2 a Excel (sin guardar ni imprimir; Excel queda abierto).
+Private Sub cmdExcel_Click()
+    Dim iPuntero As Integer, sDesc As String, bAbierto As Boolean
+    If iReporte <> kFormatos_5_2 Then Exit Sub
+    iPuntero = Screen.MousePointer
+    On Error GoTo Fallo
+    cmdExcel.Enabled = False
+    Screen.MousePointer = vbHourglass
+    PreparaDetalledelDiarioSimplificado
+    If D52_NumDetalles() > 0 Then
+        bAbierto = ExcelDiarioSimplificadoF52(cCia, cRUC, kTITULO_FORMATO_5_2, UCase(oString.Periodo(CInt(Val(cMesPro) - 1))) & " " & cAnoPro)
+    End If
+    Screen.MousePointer = iPuntero
+    cmdExcel.Enabled = True
+    If Not bAbierto Then MsgBox "No hay movimientos para el período seleccionado.", vbInformation, "Formato 5.2"
+    Exit Sub
+Fallo:
+    sDesc = Err.Description
+    Screen.MousePointer = iPuntero
+    cmdExcel.Enabled = True
+    MsgBox "No se pudo generar el Excel del Formato 5.2." & vbCrLf & vbCrLf & sDesc, vbCritical, "Formato 5.2"
+End Sub
+
+' Inserta una transaccion sintetica (saldo inicial o resumen de compras/ventas).
+' Debe/Haber se registran igual que antes (con los importes MN). Reintenta un
+' numero acotado de veces ante bloqueos (3260/3197) y propaga cualquier otro
+' error para no producir reportes contables incompletos en silencio.
+Private Sub ActualizaTransacciones(rs4 As DAO.Recordset, Tipo As String, Numero As String, Cuenta As String, Fecha As String, Debe As Currency, Haber As Currency, DebeMN As Currency, HaberMN As Currency, DebeME As Currency, HaberME As Currency, Detalle As String)
+    Dim iIntentos As Integer
+    Dim lErr As Long, sSrc As String, sDesc As String
     On Error GoTo TraperErrors
-    Dim iIndice As Integer
-    Dim intLockCount As Integer
-    Dim intRndCount As Integer
-     
+
     With rs4
         .AddNew
         !Tipo = Tipo
@@ -1022,67 +1080,189 @@ Private Function ActualizaTransacciones(rs4 As DAO.Recordset, Tipo As String, Nu
         !HaberME = HaberME
         .Update
     End With
-    
-CleanExit:
-    Exit Function
-    
+    Exit Sub
+
 TraperErrors:
     Select Case Err.Number
         Case 3260, 3197
-            intLockCount = intLockCount + 1
-            If intLockCount > 3 Then
-                If MsgBox(Err.Description & " ¿Desea reintentar?", vbOKCancel, "Cuidado") = vbYes Then
-                    intLockCount = 1
-                Else
-                    Resume CleanExit
-                End If
+            iIntentos = iIntentos + 1
+            If iIntentos <= kMAX_REINTENTOS_BLOQUEO Then
+                Sleep 200 * iIntentos
+                Resume
             End If
-            DoEvents
-            intRndCount = intLockCount ^ 2 * Int(Rnd * 3000 + 1000)
-            For iIndice = 1 To intRndCount: DoEvents: Next iIndice
-            Resume
-    
-        Case -2147467259, -2147217864
-            Err.Clear
-            Resume
-            
-        Case Else ' Error inesperado.
-            MsgBox Err.Description, vbCritical, "Error"
-            Resume CleanExit
     End Select
+    lErr = Err.Number: sSrc = Err.Source: sDesc = Err.Description
+    On Error Resume Next
+    If rs4.EditMode <> dbEditNone Then rs4.CancelUpdate
+    On Error GoTo 0
+    Err.Raise lErr, sSrc, "No se pudo registrar la transacción de la cuenta " & Cuenta & ": " & sDesc
+End Sub
+
+' Ejecuta una sentencia en dbWorkArea dentro de una transaccion propia
+' (DBEngine.Workspaces(0), el mismo espacio de trabajo usado antes). Si falla,
+' revierte solo esa transaccion y propaga el error con la sentencia.
+Private Sub EjecutarSQL(ByVal sSql As String)
+    Dim bTrans As Boolean
+    Dim lErr As Long, sSrc As String, sDesc As String
+    On Error GoTo Fallo
+    DBEngine.Workspaces(0).BeginTrans
+    bTrans = True
+    dbWorkArea.Execute sSql, dbFailOnError
+    DBEngine.Workspaces(0).CommitTrans
+    bTrans = False
+    Exit Sub
+Fallo:
+    lErr = Err.Number: sSrc = Err.Source: sDesc = Err.Description
+    If bTrans Then
+        On Error Resume Next
+        DBEngine.Workspaces(0).Rollback
+        On Error GoTo 0
+    End If
+    Err.Raise lErr, sSrc, sDesc & vbCrLf & "SQL: " & Left$(sSql, 400)
+End Sub
+
+Private Sub BorrarTabla(ByVal sTabla As String)
+    If oArchivo.IsTableName(dbWorkArea, sTabla) Then
+        dbWorkArea.Execute "DROP TABLE " & sTabla, dbFailOnError
+    End If
+End Sub
+
+' Limpieza en rutas de error: no debe ocultar el error original.
+Private Sub BorrarTablaSilencioso(ByVal sTabla As String)
+    On Error Resume Next
+    If oArchivo.IsTableName(dbWorkArea, sTabla) Then dbWorkArea.Execute "DROP TABLE " & sTabla
+    Err.Clear
+End Sub
+
+Private Sub CerrarRecordset(rs As DAO.Recordset)
+    On Error Resume Next
+    If Not rs Is Nothing Then rs.Close
+    Set rs = Nothing
+    Err.Clear
+End Sub
+
+Private Function NzMonto(ByVal v As Variant) As Currency
+    If Not (IsNull(v) Or IsEmpty(v)) Then NzMonto = CCur(v)
 End Function
 
+' Preparacion compartida por el modo Analitico y Resumido:
+' copia cfTra en sDestino (Orden = 1) y agrega
+'   - lineas con centro de costo, con Cuenta = Centro_de_Costo (Orden = 4)
+'   - su contrapartida en 7911101 con debe/haber invertidos
+'     (MesPro = 'XX' y Orden = 3 en las que pasaron de haber a debe).
+' Mismas sentencias y mismo orden que la version anterior (no cambia signos).
+' Una fila con Debe > 0 y Haber > 0 conserva el comportamiento previo: su
+' contrapartida queda solo en el haber por el importe del Debe.
+' Nunca modifica cfTra; sTmpCC y sTmpContra son tablas de trabajo.
+Private Sub PreparaTransaccionesConCostos(ByVal sDestino As String, ByVal sTmpCC As String, ByVal sTmpContra As String)
+    Dim sCtaContra As String
+    sCtaContra = Mid(kCTA_CONTRA_COSTOS, 1, iLongCta)
+
+    BorrarTabla sTmpCC
+    BorrarTabla sTmpContra
+    BorrarTabla sDestino
+    EjecutarSQL "SELECT * INTO " & sTmpCC & " FROM [" & dbEmpresa.Name & "]." & cfTra & " WHERE TRIM(Centro_de_Costo) <> ''"
+    EjecutarSQL "UPDATE " & sTmpCC & " SET Cuenta = Centro_de_Costo"
+    EjecutarSQL "UPDATE " & sTmpCC & " SET Centro_de_Costo = '" & Space(iLongCta) & "', Orden = 4"
+    EjecutarSQL "SELECT * INTO " & sTmpContra & " FROM " & sTmpCC
+    EjecutarSQL "UPDATE " & sTmpContra & " SET Cuenta = '" & sCtaContra & "', Haber = Debe, HaberMN = DebeMN, HaberME = DebeME WHERE Debe > 0"
+    EjecutarSQL "UPDATE " & sTmpContra & " SET Debe = 0, DebeMN = 0, DebeME = 0 WHERE Debe > 0"
+    EjecutarSQL "UPDATE " & sTmpContra & " SET Cuenta = '" & sCtaContra & "', Debe = Haber, DebeMN = HaberMN, DebeME = HaberME, Mespro = 'XX' WHERE Haber > 0 And Cuenta <> '" & sCtaContra & "'"
+    EjecutarSQL "UPDATE " & sTmpContra & " SET Haber = 0, HaberMN = 0, HaberME = 0, Orden = 3 WHERE MesPro = 'XX'"
+    EjecutarSQL "SELECT * INTO " & sDestino & " FROM [" & dbEmpresa.Name & "]." & cfTra
+    EjecutarSQL "UPDATE " & sDestino & " SET ORDEN = 1"
+    EjecutarSQL "INSERT INTO " & sDestino & " SELECT * FROM " & sTmpCC
+    EjecutarSQL "INSERT INTO " & sDestino & " SELECT * FROM " & sTmpContra
+End Sub
+
+' Valida que todas las cuentas del diario se puedan clasificar por rango
+' (dos digitos iniciales; clase 0 = Cuentas de Orden). Si no, informa cuales.
+Private Sub ValidarCuentasDiario(ByVal sTabla As String)
+    Dim rs As DAO.Recordset
+    Dim sLista As String, lInvalidas As Long
+    Dim lErr As Long, sSrc As String, sDesc As String
+    On Error GoTo Fallo
+    Set rs = dbWorkArea.OpenRecordset("SELECT Tr.Cuenta, Count(*) AS Lineas FROM " & sTabla & " Tr GROUP BY Tr.Cuenta ORDER BY Tr.Cuenta", dbOpenSnapshot)
+    Do While Not rs.EOF
+        If D52_ClasificarCuenta(rs!Cuenta) = 0 Then
+            lInvalidas = lInvalidas + 1
+            If lInvalidas <= 10 Then sLista = sLista & vbCrLf & "   '" & D52_Texto(rs!Cuenta) & "' (" & rs!Lineas & " línea(s))"
+        End If
+        rs.MoveNext
+    Loop
+    CerrarRecordset rs
+    If lInvalidas > 0 Then
+        Err.Raise D52_ERR_CUENTA_INVALIDA, "ValidarCuentasDiario", _
+                  "Hay " & lInvalidas & " cuenta(s) vacías o que no empiezan con dos dígitos; " & _
+                  "no se pueden agrupar (Activo Corriente ... Cuentas de Orden):" & sLista
+    End If
+    Exit Sub
+Fallo:
+    lErr = Err.Number: sSrc = Err.Source: sDesc = Err.Description
+    CerrarRecordset rs
+    Err.Raise lErr, sSrc, sDesc
+End Sub
+
+' Auxiliar (proveedor) de cada voucher de compras (TipoNumero 6*), para el CAR.
+' Se toma el menor Auxiliar no vacio del voucher: independiente del orden de
+' lectura (antes dependia de la primera linea leida de cada voucher).
+Private Function AuxiliaresDeCompras(ByVal sTabla As String) As Collection
+    Dim rs As DAO.Recordset, colAux As Collection
+    Dim lErr As Long, sSrc As String, sDesc As String
+    On Error GoTo Fallo
+    Set colAux = New Collection
+    Set rs = dbWorkArea.OpenRecordset("SELECT Ctb.TipoNumero, Min(Ctb.Auxiliar) AS AuxCompra FROM " & sTabla & " Ctb " & _
+                                      "WHERE Left(Ctb.TipoNumero, 1) = '6' AND Ctb.Auxiliar Is Not Null AND Trim(Ctb.Auxiliar) <> '' " & _
+                                      "GROUP BY Ctb.TipoNumero", dbOpenSnapshot)
+    Do While Not rs.EOF
+        If D52_Texto(rs!TipoNumero) <> "" Then colAux.Add D52_Texto(rs!AuxCompra), D52_Texto(rs!TipoNumero)
+        rs.MoveNext
+    Loop
+    CerrarRecordset rs
+    Set AuxiliaresDeCompras = colAux
+    Exit Function
+Fallo:
+    lErr = Err.Number: sSrc = Err.Source: sDesc = Err.Description
+    CerrarRecordset rs
+    Err.Raise lErr, sSrc, sDesc
+End Function
+
+Private Function AuxiliarDeCompra(colAux As Collection, ByVal sTipoNumero As String) As String
+    On Error Resume Next
+    AuxiliarDeCompra = colAux(sTipoNumero)
+    Err.Clear
+End Function
+
+' Prepara el Formato 5.2:
+'   cfFile10 (detalle por cuenta/columna), cfFile11 (cabeceras de 14 cuentas) y
+'   cfFile7 (filas agrupadas) para Crystal, y el modelo en memoria
+'   (DllRSimple_Diario52) que usa la exportacion a Excel.
+' Orden: seccion (Activo Corriente ... Analitica, Cuentas de Orden al final),
+' Cuenta, saldo inicial, Fecha_Documento, TipoNumero, Fecha_Operacion.
+' Ante cualquier error se cierran recordsets, el modelo queda "no listo" y se
+' propaga el error al llamador.
 Private Sub PreparaDetalledelDiarioSimplificado()
     Dim rs1 As DAO.Recordset, rs4 As DAO.Recordset, rsSaldos As DAO.Recordset
-    Dim sSql As String, sLastDate As String, lRegistros As Long
-    
-    If oArchivo.IsTableName(dbWorkArea, cfFile14) Then
-        Call dbWorkArea.Execute("Drop Table " & cfFile14)
-    End If
-    
-    If oArchivo.IsTableName(dbWorkArea, cfFile10) Then
-        Call dbWorkArea.Execute("Drop Table " & cfFile10)
-    End If
-    
-    If oArchivo.IsTableName(dbWorkArea, cfFile11) Then
-        Call dbWorkArea.Execute("Drop Table " & cfFile11)
-    End If
-    
-    If oArchivo.IsTableName(dbWorkArea, cfFile) Then
-        Call dbWorkArea.Execute("Drop Table " & cfFile)
-    End If
+    Dim sSql As String, sLastDate As String
+    Dim cDebeMN As Currency, cHaberMN As Currency, cResultado As Currency
+    Dim colAux As Collection
+    Dim lCab As Long, iCol As Integer, iSec As Integer, iIndex As Integer
+    Dim sCuenta As String, sTipoNumero As String, sCAR As String, sSI As String
+    Dim cMonto As Currency, bTipoTexto As Boolean, iLargoNombre As Integer
+    Dim sCampos As String, sSumas As String, sMonto As String
+    Dim lErr As Long, sSrc As String, sDesc As String
 
-    If oArchivo.IsTableName(dbWorkArea, cfFile7) Then
-        Call dbWorkArea.Execute("Drop Table " & cfFile7)
-    End If
-    
-    If oArchivo.IsTableName(dbWorkArea, cfFile8) Then
-        Call dbWorkArea.Execute("Drop Table " & cfFile8)
-    End If
-    If oArchivo.IsTableName(dbWorkArea, cfFile9) Then
-        Call dbWorkArea.Execute("Drop Table " & cfFile9)
-    End If
-    
+    On Error GoTo Fallo
+    D52_Iniciar
+
+    BorrarTabla cfFile14
+    BorrarTabla cfFile10
+    BorrarTabla cfFile11
+    BorrarTabla cfFile
+    BorrarTabla cfFile7
+    BorrarTabla cfFile8
+    BorrarTabla cfFile9
+
     Call oArchivo.CopyStructCTB(db, dbWorkArea, "xCtbDiario", cfFile10, False, iLongCta)
     Call oArchivo.CopyStructCTB(db, dbWorkArea, "xCtbDiario1", cfFile11, False, iLongCta)
     dbWorkArea.TableDefs.Refresh    ' No borrar
@@ -1091,29 +1271,20 @@ Private Sub PreparaDetalledelDiarioSimplificado()
         Else
             Call PreparaDiarioResumido
     End If
-    If oArchivo.IsTableName(dbWorkArea, cfFile8) Then
-        Call dbWorkArea.Execute("Drop Table " & cfFile8)
-    End If
-    If oArchivo.IsTableName(dbWorkArea, cfFile9) Then
-        Call dbWorkArea.Execute("Drop Table " & cfFile9)
-    End If
-    sSql = "SELECT * INTO " & cfFile8 & " FROM [" & dbEmpresa.Name & "]." & cfPla
-    dbWorkArea.Execute sSql
-    sSql = "SELECT * INTO " & cfFile9 & " FROM [" & dbEmpresa.Name & "].xCtbBalance"
-    dbWorkArea.Execute sSql
+    BorrarTabla cfFile8
+    BorrarTabla cfFile9
+    EjecutarSQL "SELECT * INTO " & cfFile8 & " FROM [" & dbEmpresa.Name & "]." & cfPla
+    EjecutarSQL "SELECT * INTO " & cfFile9 & " FROM [" & dbEmpresa.Name & "].xCtbBalance"
 
+    ' Saldos iniciales: mismo criterio de periodo que la version anterior
+    ' (fecha = ultimo dia del mes cMesPro - 2, saldo acumulado 1..cMesPro - 1).
+    ' Ver README: la convencion de cMesPro la define el sistema llamador.
     Set rs4 = dbWorkArea.OpenRecordset(cfFile)
     Set rsSaldos = dbEmpresa.OpenRecordset(cfSa1)
     rsSaldos.Index = "Busqueda"
     If Val(cMesPro) > 1 Then
-        Set rs1 = dbEmpresa.OpenRecordset("Select Sa.Cuenta, Pl.Analisis From " & cfSa1 & " Sa INNER JOIN " & cfPla & " Pl ON Sa.Cuenta = Pl.Cuenta WHERE Pl.Analisis AND Sa.Tipo = '01'")
-        If Val(cMesPro) > 1 Then
-                sLastDate = Format(oString.LastDayofMonth("01/" + oString.PadLeft(Str(Val(cMesPro) - 2), 2, "0") + "/" + cAnoPro), kFORMAT_TO_SAVE_DATE)
-            Else
-                sLastDate = Format(oString.LastDayofMonth("31/12/" + Trim(Str(Val(cAnoPro) - 1))), kFORMAT_TO_SAVE_DATE)
-        End If
-        
-        Dim cDebeMN As Currency, cHaberMN As Currency, cResultado As Currency
+        Set rs1 = dbEmpresa.OpenRecordset("Select Sa.Cuenta, Pl.Analisis From " & cfSa1 & " Sa INNER JOIN " & cfPla & " Pl ON Sa.Cuenta = Pl.Cuenta WHERE Pl.Analisis AND Sa.Tipo = '01' ORDER BY Sa.Cuenta", dbOpenSnapshot)
+        sLastDate = Format(oString.LastDayofMonth("01/" + oString.PadLeft(Str(Val(cMesPro) - 2), 2, "0") + "/" + cAnoPro), kFORMAT_TO_SAVE_DATE)
         With rs1
             Do While Not .EOF
                 cDebeMN = 0
@@ -1125,290 +1296,202 @@ Private Sub PreparaDetalledelDiarioSimplificado()
                         cHaberMN = cResultado * -1
                 End If
                 If cResultado <> 0 Then
-                    ActualizaTransacciones rs4, "001", "000000", !Cuenta, sLastDate, cDebeMN, cHaberMN, cDebeMN, cHaberMN, 0, 0, "Saldo Inicial"
+                    ActualizaTransacciones rs4, "001", "000000", D52_Texto(!Cuenta), sLastDate, cDebeMN, cHaberMN, cDebeMN, cHaberMN, 0, 0, "Saldo Inicial"
                 End If
                 .MoveNext
             Loop
-            .Close
         End With
+        CerrarRecordset rs1
     End If
-    rs4.Close
-    rsSaldos.Close
-    Set rs1 = Nothing
-    Set rs4 = Nothing
-    Set rsSaldos = Nothing
-    
+    CerrarRecordset rs4
+    CerrarRecordset rsSaldos
+
+    ValidarCuentasDiario cfFile
+
+    ' LEFT JOIN: una cuenta sin plan o sin tipo de balance ya no se descarta.
     sSql = "SELECT Tr.Cuenta, Tr.Fecha_Documento, Tr.Detalle AS Detalle, Tr.TipoNumero, Tr.Tipo_Documento, Tr.Serie_Documento, Tr.Numero_Documento, Tr.Auxiliar, Tr.DebeMN, Tr.HaberMN, Tr.Fecha_Operacion, Pl.Tipo, xCtb.Nombre INTO " & cfFile14 & " " & _
-           "From (" & cfFile & " Tr INNER JOIN " & cfFile8 & " Pl ON Tr.Cuenta = Pl.Cuenta) INNER JOIN " & cfFile9 & " xCtb ON Pl.Tipo = xCtb.Id ORDER BY Pl.Tipo ASC, Tr.Cuenta ASC, Tr.Fecha_Operacion ASC, Tr.TipoNumero ASC"
-    dbWorkArea.Execute sSql
-    If oArchivo.IsTableName(dbWorkArea, cfFile7) Then dbWorkArea.Execute ("DROP TABLE " & cfFile7)
-    Set rs1 = dbWorkArea.OpenRecordset(cfFile14)
+           "FROM (" & cfFile & " Tr LEFT JOIN " & cfFile8 & " Pl ON Tr.Cuenta = Pl.Cuenta) LEFT JOIN " & cfFile9 & " xCtb ON Pl.Tipo = xCtb.Id"
+    EjecutarSQL sSql
+
+    Set colAux = AuxiliaresDeCompras(cfFile14)
+
+    ' Orden explicito del recordset (no se depende del orden fisico de SELECT INTO)
+    Set rs1 = dbWorkArea.OpenRecordset("SELECT Ctb.* FROM " & cfFile14 & " Ctb ORDER BY IIf(Left(Ctb.Cuenta, 1) = '0', 1, 0), Ctb.Cuenta, " & _
+                                       "IIf(Ctb.TipoNumero = '" & D52_TIPONUMERO_SALDO_INICIAL & "', 0, 1), Ctb.Fecha_Documento, Ctb.TipoNumero, Ctb.Fecha_Operacion", dbOpenSnapshot)
+    D52_EstablecerFechasTipadas (rs1.Fields("Fecha_Documento").Type = dbDate)
     Set rsSaldos = dbWorkArea.OpenRecordset(cfFile11)
     Set rs4 = dbWorkArea.OpenRecordset(cfFile10)
-    Dim X As Integer, ay(14) As String, iIndex As Integer, iCabecera As Integer, iTipo As Integer
-    X = -1
-    iCabecera = 1
-    Dim sTipoNumero As String, sAuxiliar As String
-    With rs4
-        Do While Not rs1.EOF
-            iTipo = rs1!Tipo
-            Do While Not rs1.EOF
-                If iTipo <> rs1!Tipo Then Exit Do
-                If oString.ASearch(ay, rs1!Cuenta) = -1 Then
-                        If X >= 13 Then
-                                rsSaldos.AddNew
-                                rsSaldos!Cabecera = iCabecera
-                                For iIndex = 0 To 13
-                                    rsSaldos.Fields(iIndex + 2).Value = ay(iIndex)
-                                    ay(iIndex) = ""
-                                Next
-                                rsSaldos.Update
-                                iCabecera = iCabecera + 1
-                                X = 0
-                            Else
-                                X = X + 1
-                        End If
-                        ay(X) = rs1!Cuenta
-                End If
-                If Mid(rs1!TipoNumero, 1, 1) = "6" Then
-                    If sTipoNumero <> rs1!TipoNumero Then
-                        sTipoNumero = rs1!TipoNumero
-                        sAuxiliar = ""
-                        If rs1!Auxiliar <> "" Then
-                            sAuxiliar = rs1!Auxiliar
-                        End If
-                    End If
-                End If
-                .AddNew
-                !Cabecera = iCabecera
-                !SI = IIf(rs1!TipoNumero = "001000000", "1", "2")
-                !Tipo = rs1!Tipo
-                !Nombre = rs1!Nombre
-                !Cuenta = rs1!Cuenta
-                !Fecha_Documento = rs1!Fecha_Documento
-                !Detalle = rs1!Detalle
-                If Mid(rs1!TipoNumero, 1, 1) = "7" Then
-                        !TipoNumero = Right(cRUC, 11) & rs1!Tipo_Documento + Trim(rs1!Serie_Documento) + rs1!Numero_Documento
-                    ElseIf Mid(rs1!TipoNumero, 1, 1) = "6" Then
-                        !TipoNumero = sAuxiliar & rs1!Tipo_Documento + Trim(rs1!Serie_Documento) + rs1!Numero_Documento
-                    Else
-                        !TipoNumero = rs1!TipoNumero
-                End If
-                !Fecha_Operacion = rs1!Fecha_Operacion
-                .Fields(X + 10).Value = rs1!DebeMN - rs1!HaberMN
-                .Update
-                rs1.MoveNext
-            Loop
-            rsSaldos.AddNew
-            rsSaldos!Cabecera = iCabecera
-            For iIndex = 0 To 13
-                rsSaldos.Fields(iIndex + 2).Value = ay(iIndex)
-                ay(iIndex) = ""
-            Next
-            rsSaldos.Update
-            iCabecera = iCabecera + 1
-            X = -1
-        Loop
-        .Close
-    End With
-    rsSaldos.Close
-    rs1.Close
-    DBEngine.BeginTrans
-    ' Original
-'    Call dbWorkArea.Execute("SELECT Cabecera, Tipo, Nombre, SI, TipoNumero, Fecha_Operacion, Detalle, SUM(S1) AS S1a, SUM(S2) AS S2a, SUM(S3) AS S3a, SUM(S4) AS S4a, SUM(S5) AS S5a, SUM(S6) AS S6a, SUM(S7) AS S7a, SUM(S8) AS S8a, SUM(S9) AS S9a, SUM(S10) AS S10a, SUM(S11) AS S11a, SUM(S12) AS S12a, SUM(S13) AS S13a, SUM(S14) AS S14a INTO " & cfFile7 & " " & _
-           "From " & cfFile10 & " GROUP BY Cabecera, Tipo, Nombre, SI, TipoNumero, Fecha_Operacion, Detalle ORDER BY Cabecera, Tipo, Nombre, SI, TipoNumero, Fecha_Operacion, Detalle")
-    
-'   Modificado para Milton Flores
-    Call dbWorkArea.Execute("SELECT Cabecera, Tipo, Nombre, SI, TipoNumero, Fecha_Operacion, Detalle, SUM(S1) AS S1a, SUM(S2) AS S2a, SUM(S3) AS S3a, SUM(S4) AS S4a, SUM(S5) AS S5a, SUM(S6) AS S6a, SUM(S7) AS S7a, SUM(S8) AS S8a, SUM(S9) AS S9a, SUM(S10) AS S10a, SUM(S11) AS S11a, SUM(S12) AS S12a, SUM(S13) AS S13a, SUM(S14) AS S14a INTO " & cfFile7 & " " & _
-           "From " & cfFile10 & " WHERE S1 > 0 OR S2 > 0 OR S3 > 0 OR S4 > 0 OR S5 > 0 OR S6 > 0 OR S7 > 0 OR S8 > 0 OR S9 > 0 OR S10 > 0 OR S11 > 0 OR S12 > 0 OR S13 > 0 OR S14 > 0 GROUP BY Cabecera, Tipo, Nombre, SI, TipoNumero, Fecha_Operacion, Detalle ORDER BY Cabecera, Tipo, Nombre, SI, TipoNumero, Fecha_Operacion, Detalle")
-           
-    Call dbWorkArea.Execute("INSERT INTO " & cfFile7 & " SELECT Cabecera, Tipo, Nombre, SI, TipoNumero, Fecha_Operacion, Detalle, SUM(S1) AS S1a, SUM(S2) AS S2a, SUM(S3) AS S3a, SUM(S4) AS S4a, SUM(S5) AS S5a, SUM(S6) AS S6a, SUM(S7) AS S7a, SUM(S8) AS S8a, SUM(S9) AS S9a, SUM(S10) AS S10a, SUM(S11) AS S11a, SUM(S12) AS S12a, SUM(S13) AS S13a, SUM(S14) AS S14a " & _
-           "From " & cfFile10 & " WHERE S1 <= 0 OR S2 <= 0 OR S3 <= 0 OR S4 <= 0 OR S5 <= 0 OR S6 <= 0 OR S7 <= 0 OR S8 <= 0 OR S9 <= 0 OR S10 <= 0 OR S11 <= 0 OR S12 <= 0 OR S13 <= 0 OR S14 <= 0 GROUP BY Cabecera, Tipo, Nombre, SI, TipoNumero, Fecha_Operacion, Detalle ORDER BY Cabecera, Tipo, Nombre, SI, TipoNumero, Fecha_Operacion, Detalle")
-           
-    DBEngine.CommitTrans
+    bTipoTexto = (rs4.Fields("Tipo").Type = dbText)
+    iLargoNombre = 0
+    If rs4.Fields("Nombre").Type = dbText Then iLargoNombre = rs4.Fields("Nombre").Size
+
+    Do While Not rs1.EOF
+        sCuenta = D52_Texto(rs1!Cuenta)
+        lCab = D52_UbicarCuenta(sCuenta, iCol)
+        iSec = D52_BloqueSeccion(lCab)
+        sTipoNumero = D52_Texto(rs1!TipoNumero)
+        sSI = D52_SI(sTipoNumero)
+        sCAR = D52_CAR(sTipoNumero, D52_Texto(rs1!Tipo_Documento), D52_Texto(rs1!Serie_Documento), _
+                       D52_Texto(rs1!Numero_Documento), AuxiliarDeCompra(colAux, sTipoNumero), cRUC)
+        cMonto = D52_Monto(rs1!DebeMN, rs1!HaberMN)
+        With rs4
+            .AddNew
+            !Cabecera = lCab
+            !SI = sSI
+            If bTipoTexto Then
+                !Tipo = Format(iSec, "00")
+            Else
+                !Tipo = iSec
+            End If
+            If iLargoNombre > 0 Then
+                !Nombre = Left$(D52_NombreSeccion(iSec), iLargoNombre)
+            Else
+                !Nombre = D52_NombreSeccion(iSec)
+            End If
+            !Cuenta = rs1!Cuenta
+            !Fecha_Documento = rs1!Fecha_Documento
+            !Detalle = rs1!Detalle
+            !TipoNumero = sCAR
+            !Fecha_Operacion = rs1!Fecha_Operacion
+            .Fields("S" & CStr(iCol + 1)).Value = cMonto
+            .Update
+        End With
+        D52_AgregarDetalle lCab, iCol, sCuenta, rs1!Fecha_Documento, rs1!Fecha_Operacion, sSI, sCAR, D52_Texto(rs1!Detalle), cMonto
+        rs1.MoveNext
+    Loop
+    CerrarRecordset rs1
+    CerrarRecordset rs4
+
+    ' Cabeceras posicionales (Cabecera + 14 codigos de cuenta) para Crystal
+    For lCab = 1 To D52_NumBloques()
+        rsSaldos.AddNew
+        rsSaldos!Cabecera = lCab
+        For iIndex = 0 To D52_COLUMNAS - 1
+            If iIndex < D52_BloqueNumCuentas(lCab) Then
+                rsSaldos.Fields(iIndex + 2).Value = D52_BloqueCuenta(lCab, iIndex)
+            Else
+                rsSaldos.Fields(iIndex + 2).Value = ""
+            End If
+        Next
+        rsSaldos.Update
+    Next
+    CerrarRecordset rsSaldos
+
+    ' cfFile7: filas de debe y de haber por separado (criterio "Milton Flores").
+    ' Cada linea de cfFile10 tiene un solo importe (S1..S14), por lo que la suma
+    ' de las 14 columnas es el importe de la linea: particion exacta, sin duplicar
+    ' sumas aunque las columnas no usadas valgan 0 en lugar de Null.
+    sMonto = "(IIf(S1 Is Null, 0, S1)"
+    For iIndex = 2 To D52_COLUMNAS
+        sMonto = sMonto & " + IIf(S" & iIndex & " Is Null, 0, S" & iIndex & ")"
+    Next
+    sMonto = sMonto & ")"
+    sSumas = "SUM(S1) AS S1a"
+    For iIndex = 2 To D52_COLUMNAS
+        sSumas = sSumas & ", SUM(S" & iIndex & ") AS S" & iIndex & "a"
+    Next
+    sCampos = "Cabecera, Tipo, Nombre, SI, TipoNumero, Fecha_Operacion, Detalle"
+    BorrarTabla cfFile7
+    EjecutarSQL "SELECT " & sCampos & ", " & sSumas & ", Fecha_Documento INTO " & cfFile7 & " FROM " & cfFile10 & _
+                " WHERE " & sMonto & " > 0 GROUP BY " & sCampos & ", Fecha_Documento ORDER BY Cabecera, SI, Fecha_Documento, TipoNumero"
+    EjecutarSQL "INSERT INTO " & cfFile7 & " SELECT " & sCampos & ", " & sSumas & ", Fecha_Documento FROM " & cfFile10 & _
+                " WHERE " & sMonto & " <= 0 GROUP BY " & sCampos & ", Fecha_Documento ORDER BY Cabecera, SI, Fecha_Documento, TipoNumero"
+
     lRegistros = oArchivo.DAOExecuteReturn(dbWorkArea, "Select Count(*) From " & cfFile7, 0)
+    D52_MarcarListo True
+    Exit Sub
+
+Fallo:
+    lErr = Err.Number: sSrc = Err.Source: sDesc = Err.Description
+    CerrarRecordset rs1
+    CerrarRecordset rs4
+    CerrarRecordset rsSaldos
+    D52_MarcarListo False
+    BorrarTablaSilencioso cfFile7
+    Err.Raise lErr, sSrc, sDesc
 End Sub
 
 Private Sub AgregadoCtasCostos(File_Name As String)
-    Dim sSql As String
-    Dim sfFile7 As String, sfFile8 As String, sfFile9 As String
-    
-    sfFile7 = oArchivo.FileTemp(dbWorkArea)
-    sfFile8 = oArchivo.FileTemp(dbWorkArea)
-    sfFile9 = oArchivo.FileTemp(dbWorkArea)
-    
-    sSql = "SELECT * INTO " & sfFile7 & " FROM [" & dbEmpresa.Name & "]." & cfTra & " WHERE TRIM(Centro_de_Costo) <> ''"
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "UPDATE " & sfFile7 & " SET Cuenta = Centro_de_Costo"
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "UPDATE " & sfFile7 & " SET Centro_de_Costo = '" & Space(iLongCta) & "', Orden = 4"
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "SELECT * INTO " & sfFile8 & " FROM " & sfFile7
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "UPDATE " & sfFile8 & " SET Cuenta = '" & Mid("7911101     ", 1, iLongCta) & "', Haber = Debe, HaberMN = DebeMN, HaberME = DebeME WHERE Debe > 0"
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "UPDATE " & sfFile8 & " SET Debe = 0, DebeMN = 0, DebeME = 0 WHERE Debe > 0"
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "UPDATE " & sfFile8 & " SET Cuenta = '" & Mid("7911101     ", 1, iLongCta) & "', Debe = Haber, DebeMN = HaberMN, DebeME = HaberME, Mespro = 'XX' WHERE Haber > 0 And Cuenta <> '" & Mid("7911101     ", 1, iLongCta) & "'"
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "UPDATE " & sfFile8 & " SET Haber = 0, HaberMN = 0, HaberME = 0, Orden = 3 WHERE MesPro = 'XX'"
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "SELECT * INTO " & File_Name & " FROM [" & dbEmpresa.Name & "]." & cfTra
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "UPDATE " & File_Name & " SET ORDEN = 1"
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "INSERT INTO " & File_Name & " SELECT * FROM " & sfFile7
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "INSERT INTO " & File_Name & " SELECT * FROM " & sfFile8
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
+    Dim sTmpCC As String, sTmpContra As String
+    Dim lErr As Long, sSrc As String, sDesc As String
+    On Error GoTo Fallo
+
+    sTmpCC = oArchivo.FileTemp(dbWorkArea)
+    sTmpContra = oArchivo.FileTemp(dbWorkArea)
+    PreparaTransaccionesConCostos File_Name, sTmpCC, sTmpContra
+    BorrarTabla sTmpCC
+    BorrarTabla sTmpContra
     dbWorkArea.TableDefs.Refresh    ' No borrar
-    If oArchivo.IsTableName(dbWorkArea, sfFile7) Then
-        DBEngine.BeginTrans
-        Call dbWorkArea.Execute("Drop Table " & sfFile7)
-        DBEngine.CommitTrans
-    End If
-    If oArchivo.IsTableName(dbWorkArea, sfFile8) Then
-        DBEngine.BeginTrans
-        Call dbWorkArea.Execute("Drop Table " & sfFile8)
-        DBEngine.CommitTrans
-    End If
-    If oArchivo.IsTableName(dbWorkArea, sfFile9) Then
-        DBEngine.BeginTrans
-        Call dbWorkArea.Execute("Drop Table " & sfFile9)
-        DBEngine.CommitTrans
-    End If
-    dbWorkArea.TableDefs.Refresh    ' No borrar
+    Exit Sub
+
+Fallo:
+    lErr = Err.Number: sSrc = Err.Source: sDesc = Err.Description
+    BorrarTablaSilencioso sTmpCC
+    BorrarTablaSilencioso sTmpContra
+    Err.Raise lErr, sSrc, sDesc
 End Sub
 
+' Modo Resumido: los vouchers de compras/ventas (Tipo 600..799) se reemplazan por
+' un resumen por Tipo y Cuenta al cierre del mes. Las lineas se reparten en
+' grupos excluyentes para conservar el saldo:
+'   1) Debe > 0                      (igual que antes)
+'   2) Debe <= 0 y Haber > 0         (antes una fila con Debe y Haber > 0 se sumaba dos veces)
+'   3) Debe <= 0 y Haber <= 0        (antes se perdian, p.ej. importes negativos)
 Private Sub PreparaDiarioResumido()
-    Dim rs1 As DAO.Recordset
     Dim rs4 As DAO.Recordset
-    Dim sSql As String, sLastDate As String, lRegistros As Long
-    
-    dbWorkArea.TableDefs.Refresh    ' No borrar
-    If oArchivo.IsTableName(dbWorkArea, cfFile) Then
-        DBEngine.BeginTrans
-        Call dbWorkArea.Execute("Drop Table " & cfFile)
-        DBEngine.CommitTrans
-    End If
-    If oArchivo.IsTableName(dbWorkArea, cfFile7) Then
-        DBEngine.BeginTrans
-        Call dbWorkArea.Execute("Drop Table " & cfFile7)
-        DBEngine.CommitTrans
-    End If
-    If oArchivo.IsTableName(dbWorkArea, cfFile8) Then
-        DBEngine.BeginTrans
-        Call dbWorkArea.Execute("Drop Table " & cfFile8)
-        DBEngine.CommitTrans
-    End If
-    If oArchivo.IsTableName(dbWorkArea, cfFile9) Then
-        DBEngine.BeginTrans
-        Call dbWorkArea.Execute("Drop Table " & cfFile9)
-        DBEngine.CommitTrans
-    End If
+    Dim sLastDate As String
+    Dim lErr As Long, sSrc As String, sDesc As String
+    Const sDEBE As String = "IIf(Tr.Debe Is Null, 0, Tr.Debe)"
+    Const sHABER As String = "IIf(Tr.Haber Is Null, 0, Tr.Haber)"
+    On Error GoTo Fallo
 
-    sSql = "SELECT * INTO " & cfFile7 & " FROM [" & dbEmpresa.Name & "]." & cfTra & " WHERE TRIM(Centro_de_Costo) <> ''"
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "UPDATE " & cfFile7 & " SET Cuenta = Centro_de_Costo"
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "UPDATE " & cfFile7 & " SET Centro_de_Costo = '" & Space(iLongCta) & "', Orden = 4"
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "SELECT * INTO " & cfFile8 & " FROM " & cfFile7
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "UPDATE " & cfFile8 & " SET Cuenta = '" & Mid("7911101     ", 1, iLongCta) & "', Haber = Debe, HaberMN = DebeMN, HaberME = DebeME WHERE Debe > 0"
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "UPDATE " & cfFile8 & " SET Debe = 0, DebeMN = 0, DebeME = 0 WHERE Debe > 0"
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "UPDATE " & cfFile8 & " SET Cuenta = '" & Mid("7911101     ", 1, iLongCta) & "', Debe = Haber, DebeMN = HaberMN, DebeME = HaberME, Mespro = 'XX' WHERE Haber > 0 And Cuenta <> '" & Mid("7911101     ", 1, iLongCta) & "'"
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "UPDATE " & cfFile8 & " SET Haber = 0, HaberMN = 0, HaberME = 0, Orden = 3 WHERE MesPro = 'XX'"
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "SELECT * INTO " & cfFile & " FROM [" & dbEmpresa.Name & "]." & cfTra
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "UPDATE " & cfFile & " SET ORDEN = 1"
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "INSERT INTO " & cfFile & " SELECT * FROM " & cfFile7
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    sSql = "INSERT INTO " & cfFile & " SELECT * FROM " & cfFile8
-    DBEngine.BeginTrans
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    DBEngine.BeginTrans
-    sSql = "SELECT * INTO " & cfFile9 & " FROM " & cfFile & " WHERE Tipo BETWEEN '600' And '799'"
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    DBEngine.BeginTrans
-    sSql = "DELETE FROM " & cfFile & " WHERE Tipo BETWEEN '600' And '799'"
-    dbWorkArea.Execute sSql
-    DBEngine.CommitTrans
-    
+    dbWorkArea.TableDefs.Refresh    ' No borrar
+    BorrarTabla cfFile7
+    BorrarTabla cfFile8
+    BorrarTabla cfFile9
+    PreparaTransaccionesConCostos cfFile, cfFile7, cfFile8
+    EjecutarSQL "SELECT * INTO " & cfFile9 & " FROM " & cfFile & " WHERE Tipo BETWEEN '600' And '799'"
+    EjecutarSQL "DELETE FROM " & cfFile & " WHERE Tipo BETWEEN '600' And '799'"
+
     Set rs4 = dbWorkArea.OpenRecordset(cfFile)
-    Set rs1 = dbWorkArea.OpenRecordset("Select Tr.Tipo, Tr.Cuenta, SUM(Tr.Debe) AS Debe, SUM(Tr.Haber) As Haber, SUM(Tr.DebeMN) As DebeMN, SUM(Tr.HaberMN) As HaberMN, SUM(Tr.DebeME) As DebeME, SUM(Tr.HaberME) As HaberME From " & cfFile9 & " Tr WHERE Tr.Debe > 0 Group by Tipo, Cuenta")
     sLastDate = Format(oString.LastDayofMonth("01/" + oString.PadLeft(Str(Val(cMesPro) - 1), 2, "0") + "/" + cAnoPro), kFORMAT_TO_SAVE_DATE)
-    With rs1
-        Do While Not .EOF
-            ActualizaTransacciones rs4, !Tipo, "000000", !Cuenta, sLastDate, !Debe, !Haber, !DebeMN, !HaberMN, !DebeME, !HaberME, "POR LAS " & IIf(Mid(!Tipo, 1, 1) = "6", "COMPRAS", "VENTAS") & " DEL MES"
-            .MoveNext
-        Loop
-        .Close
-    End With
-    Set rs1 = dbWorkArea.OpenRecordset("Select Tr.Tipo, Tr.Cuenta, SUM(Tr.Debe) AS Debe, SUM(Tr.Haber) As Haber, SUM(Tr.DebeMN) As DebeMN, SUM(Tr.HaberMN) As HaberMN, SUM(Tr.DebeME) As DebeME, SUM(Tr.HaberME) As HaberME From " & cfFile9 & " Tr WHERE Tr.Haber > 0 Group by Tipo, Cuenta")
-    With rs1
-        Do While Not .EOF
-            ActualizaTransacciones rs4, !Tipo, "000000", !Cuenta, sLastDate, !Debe, !Haber, !DebeMN, !HaberMN, !DebeME, !HaberME, "POR LAS " & IIf(Mid(!Tipo, 1, 1) = "6", "COMPRAS", "VENTAS") & " DEL MES"
-            .MoveNext
-        Loop
-        .Close
-    End With
-    rs4.Close
-    Set rs1 = Nothing
-    Set rs4 = Nothing
+    AgregarResumenComprasVentas rs4, sDEBE & " > 0", sLastDate
+    AgregarResumenComprasVentas rs4, sDEBE & " <= 0 AND " & sHABER & " > 0", sLastDate
+    AgregarResumenComprasVentas rs4, sDEBE & " <= 0 AND " & sHABER & " <= 0", sLastDate
+    CerrarRecordset rs4
     lRegistros = oArchivo.DAOExecuteReturn(dbWorkArea, "Select Count(*) From " & cfFile, 0)
+    Exit Sub
+
+Fallo:
+    lErr = Err.Number: sSrc = Err.Source: sDesc = Err.Description
+    CerrarRecordset rs4
+    Err.Raise lErr, sSrc, sDesc
 End Sub
 
+Private Sub AgregarResumenComprasVentas(rs4 As DAO.Recordset, ByVal sFiltro As String, ByVal sLastDate As String)
+    Dim rs1 As DAO.Recordset
+    Dim cDebe As Currency, cHaber As Currency, cDebeMN As Currency, cHaberMN As Currency, cDebeME As Currency, cHaberME As Currency
+    Dim lErr As Long, sSrc As String, sDesc As String
+    On Error GoTo Fallo
+
+    Set rs1 = dbWorkArea.OpenRecordset("Select Tr.Tipo, Tr.Cuenta, SUM(Tr.Debe) AS Debe, SUM(Tr.Haber) As Haber, SUM(Tr.DebeMN) As DebeMN, SUM(Tr.HaberMN) As HaberMN, SUM(Tr.DebeME) As DebeME, SUM(Tr.HaberME) As HaberME From " & cfFile9 & " Tr " & _
+                                       "WHERE " & sFiltro & " Group by Tr.Tipo, Tr.Cuenta ORDER BY Tr.Tipo, Tr.Cuenta", dbOpenSnapshot)
+    With rs1
+        Do While Not .EOF
+            cDebe = NzMonto(!Debe): cHaber = NzMonto(!Haber)
+            cDebeMN = NzMonto(!DebeMN): cHaberMN = NzMonto(!HaberMN)
+            cDebeME = NzMonto(!DebeME): cHaberME = NzMonto(!HaberME)
+            If cDebe <> 0 Or cHaber <> 0 Or cDebeMN <> 0 Or cHaberMN <> 0 Or cDebeME <> 0 Or cHaberME <> 0 Then
+                ActualizaTransacciones rs4, D52_Texto(!Tipo), "000000", D52_Texto(!Cuenta), sLastDate, cDebe, cHaber, cDebeMN, cHaberMN, cDebeME, cHaberME, "POR LAS " & IIf(Mid(D52_Texto(!Tipo), 1, 1) = "6", "COMPRAS", "VENTAS") & " DEL MES"
+            End If
+            .MoveNext
+        Loop
+    End With
+    CerrarRecordset rs1
+    Exit Sub
+
+Fallo:
+    lErr = Err.Number: sSrc = Err.Source: sDesc = Err.Description
+    CerrarRecordset rs1
+    Err.Raise lErr, sSrc, sDesc
+End Sub
